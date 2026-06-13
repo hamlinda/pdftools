@@ -1,9 +1,13 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { UploadCloud, FileText, RotateCw, RotateCcw, Trash2, RefreshCw, Download, Info } from 'lucide-react';
-import { loadPDF, renderPageFromDocument, modifyPDF } from '../utils/pdf';
+import React, { useState, useRef } from 'react';
+import { UploadCloud, FileText, RotateCw, RotateCcw, Trash2, RefreshCw, Download, Info, Image as ImageIcon, Plus } from 'lucide-react';
+import { loadPDF, renderPageFromDocument, compileWorkspace, convertImageToJpg } from '../utils/pdf';
 
-interface PageState {
-  pageIndex: number;
+interface WorkspacePage {
+  id: string;
+  type: 'pdf' | 'image';
+  name: string;
+  pdfId: string;
+  pageNumber: number;
   dataUrl: string | null;
   rotation: number; // 0, 90, 180, 270
   deleted: boolean;
@@ -14,9 +18,8 @@ interface OrganizeTabProps {
 }
 
 export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => {
-  const [file, setFile] = useState<File | null>(null);
-  const [arrayBuffer, setArrayBuffer] = useState<ArrayBuffer | null>(null);
-  const [pages, setPages] = useState<PageState[]>([]);
+  const [pages, setPages] = useState<WorkspacePage[]>([]);
+  const [pdfBuffers, setPdfBuffers] = useState<{ [pdfId: string]: ArrayBuffer }>({});
   
   const [isDragOver, setIsDragOver] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -24,16 +27,7 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
   const [draggedIndex, setDraggedIndex] = useState<number | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  // Clean up on unmount
-  useEffect(() => {
-    return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
-    };
-  }, []);
+  const addMoreInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -48,90 +42,112 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
     e.preventDefault();
     setIsDragOver(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      await processFile(e.dataTransfer.files[0]);
+      await processFiles(Array.from(e.dataTransfer.files));
     }
   };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files.length > 0) {
-      await processFile(e.target.files[0]);
+      await processFiles(Array.from(e.target.files));
     }
   };
 
-  const processFile = async (selectedFile: File) => {
-    if (selectedFile.type !== 'application/pdf' && !selectedFile.name.endsWith('.pdf')) {
-      addNotification('Please select a valid PDF file.', 'error');
-      return;
+  const renderPdfThumbnails = async (pdf: any, pdfId: string) => {
+    const totalPages = pdf.numPages;
+    for (let i = 0; i < totalPages; i++) {
+      try {
+        const url = await renderPageFromDocument(pdf, i + 1, 150);
+        setPages((prev) =>
+          prev.map((p) =>
+            p.pdfId === pdfId && p.pageNumber === i + 1 ? { ...p, dataUrl: url } : p
+          )
+        );
+      } catch (err) {
+        console.error(`Error rendering page ${i + 1} of PDF ${pdfId}:`, err);
+      }
     }
-
-    // Cancel any ongoing thumbnail generation
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
+    if (pdf.destroy) {
+      await pdf.destroy();
     }
-    abortControllerRef.current = new AbortController();
-    const abortSignal = abortControllerRef.current.signal;
+  };
 
+  const processFiles = async (selectedFiles: File[]) => {
     setIsProcessing(true);
-    setFile(selectedFile);
-    setPages([]);
+    setLoadingStep('Processing files...');
     
-    try {
-      setLoadingStep('Reading file data...');
-      const buffer = await selectedFile.arrayBuffer();
-      setArrayBuffer(buffer);
-
-      setLoadingStep('Analyzing pages...');
-      const pdf = await loadPDF(buffer);
-      const totalPages = pdf.numPages;
+    const newPages: WorkspacePage[] = [];
+    const newPdfBuffers = { ...pdfBuffers };
+    
+    for (const file of selectedFiles) {
+      const filename = file.name.toLowerCase();
+      const isPdf = file.type === 'application/pdf' || filename.endsWith('.pdf');
+      const isImg = file.type.startsWith('image/') || /\.(jpg|jpeg|png|webp|gif|bmp|svg)$/.test(filename);
       
-      // Initialize page states immediately with placeholders
-      const initialPages: PageState[] = Array.from({ length: totalPages }, (_, i) => ({
-        pageIndex: i,
-        dataUrl: null,
-        rotation: 0,
-        deleted: false,
-      }));
-      setPages(initialPages);
-
-      // Render thumbnails incrementally
-      for (let i = 0; i < totalPages; i++) {
-        if (abortSignal.aborted) {
-          if (pdf.destroy) await pdf.destroy();
-          return;
-        }
-        setLoadingStep(`Rendering thumbnail for page ${i + 1} of ${totalPages}...`);
-        
+      if (isPdf) {
+        setLoadingStep(`Reading PDF: ${file.name}...`);
         try {
-          const url = await renderPageFromDocument(pdf, i + 1, 150);
-          setPages((prev) => 
-            prev.map((p) => p.pageIndex === i ? { ...p, dataUrl: url } : p)
-          );
+          const pdfId = 'pdf_' + Math.random().toString(36).substring(2, 9);
+          const buffer = await file.arrayBuffer();
+          newPdfBuffers[pdfId] = buffer;
+          
+          const pdf = await loadPDF(buffer);
+          const totalPages = pdf.numPages;
+          
+          const pdfPages: WorkspacePage[] = Array.from({ length: totalPages }, (_, i) => ({
+            id: Math.random().toString(36).substring(2, 9),
+            type: 'pdf',
+            name: file.name,
+            pdfId,
+            pageNumber: i + 1,
+            dataUrl: null,
+            rotation: 0,
+            deleted: false,
+          }));
+          
+          newPages.push(...pdfPages);
+          
+          // Fire-and-forget background thumbnail generator
+          renderPdfThumbnails(pdf, pdfId);
         } catch (err) {
-          console.error(`Error rendering page ${i + 1}:`, err);
+          console.error('Error reading PDF:', err);
+          addNotification(`Failed to load PDF "${file.name}"`, 'error');
         }
+      } else if (isImg) {
+        setLoadingStep(`Processing Image: ${file.name}...`);
+        try {
+          const dataUrl = await convertImageToJpg(file);
+          newPages.push({
+            id: Math.random().toString(36).substring(2, 9),
+            type: 'image',
+            name: file.name,
+            pdfId: '',
+            pageNumber: 0,
+            dataUrl,
+            rotation: 0,
+            deleted: false,
+          });
+        } catch (err) {
+          console.error('Error reading image:', err);
+          addNotification(`Failed to load image "${file.name}"`, 'error');
+        }
+      } else {
+        addNotification(`Unsupported file type: "${file.name}"`, 'error');
       }
-
-      if (pdf.destroy) {
-        await pdf.destroy();
-      }
-
-      addNotification('PDF loaded and thumbnails generated.', 'success');
-    } catch (err) {
-      console.error('Error opening PDF:', err);
-      addNotification('Failed to read the PDF document.', 'error');
-      setFile(null);
-      setArrayBuffer(null);
-      setPages([]);
-    } finally {
-      setIsProcessing(false);
-      setLoadingStep('');
     }
+    
+    if (newPages.length > 0) {
+      setPages((prev) => [...prev, ...newPages]);
+      setPdfBuffers(newPdfBuffers);
+      addNotification(`Added ${newPages.length} page(s) successfully.`, 'success');
+    }
+    setIsProcessing(false);
+    setLoadingStep('');
   };
 
-  const rotatePage = (pageIndex: number, direction: 'cw' | 'ccw') => {
+  const rotatePage = (id: string, direction: 'cw' | 'ccw') => {
     setPages((prev) =>
       prev.map((p) => {
-        if (p.pageIndex !== pageIndex) return p;
+        if (p.id !== id) return p;
         const change = direction === 'cw' ? 90 : -90;
         const newRotation = (p.rotation + change + 360) % 360;
         return { ...p, rotation: newRotation };
@@ -139,10 +155,10 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
     );
   };
 
-  const toggleDeletePage = (pageIndex: number) => {
+  const toggleDeletePage = (id: string) => {
     setPages((prev) =>
       prev.map((p) => {
-        if (p.pageIndex !== pageIndex) return p;
+        if (p.id !== id) return p;
         return { ...p, deleted: !p.deleted };
       })
     );
@@ -172,31 +188,31 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
   };
 
   const handleExport = async () => {
-    if (!arrayBuffer || pages.length === 0) return;
-
-    const activePagesCount = pages.filter((p) => !p.deleted).length;
-    if (activePagesCount === 0) {
+    const activePages = pages.filter((p) => !p.deleted);
+    if (activePages.length === 0) {
       addNotification('Cannot export a PDF with zero pages. Please restore at least one page.', 'error');
       return;
     }
 
     setIsProcessing(true);
-    setLoadingStep('Compiling and saving PDF...');
+    setLoadingStep('Compiling and generating PDF document...');
     
     try {
-      const operations = pages.map((p) => ({
-        pageIndex: p.pageIndex,
+      const compileData = activePages.map((p) => ({
+        type: p.type,
+        pdfBuffer: p.type === 'pdf' ? pdfBuffers[p.pdfId] : undefined,
+        pageNumber: p.pageNumber,
+        dataUrl: p.dataUrl,
         rotation: p.rotation,
-        deleted: p.deleted,
       }));
 
-      const modifiedBytes = await modifyPDF(arrayBuffer, operations);
+      const modifiedBytes = await compileWorkspace(compileData);
       
       const blob = new Blob([modifiedBytes.buffer as ArrayBuffer], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `organized_${file?.name || 'document.pdf'}`;
+      a.download = `organized_${Date.now()}.pdf`;
       document.body.appendChild(a);
       a.click();
       
@@ -213,13 +229,10 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
     }
   };
 
-  const clearFile = () => {
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-    setFile(null);
-    setArrayBuffer(null);
+  const clearWorkspace = () => {
     setPages([]);
+    setPdfBuffers({});
+    addNotification('Workspace cleared.', 'success');
   };
 
   const handleCardDragStart = (index: number) => {
@@ -244,7 +257,7 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
 
   return (
     <div className="tool-card">
-      {!file ? (
+      {pages.length === 0 ? (
         <div 
           className={`dropzone ${isDragOver ? 'dragover' : ''}`}
           onDragOver={handleDragOver}
@@ -253,13 +266,14 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
           onClick={() => fileInputRef.current?.click()}
         >
           <UploadCloud size={48} className="dropzone-icon" />
-          <div className="dropzone-title">Upload a PDF to Organize Pages</div>
-          <div className="dropzone-desc">Drag & drop a file, or click to browse</div>
+          <div className="dropzone-title">Upload PDFs or Images to Organize Pages</div>
+          <div className="dropzone-desc">Drag & drop files here, or click to browse</div>
           <input 
             type="file" 
             ref={fileInputRef} 
             className="file-input" 
-            accept=".pdf,application/pdf"
+            accept=".pdf,application/pdf,image/*"
+            multiple
             onChange={handleFileChange} 
           />
         </div>
@@ -269,8 +283,8 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
             <div className="file-item-left" style={{ maxWidth: '350px' }}>
               <FileText size={20} style={{ color: 'var(--color-primary)', flexShrink: 0 }} />
               <div className="file-info">
-                <div className="file-name" style={{ fontSize: '0.95rem' }} title={file.name}>
-                  {file.name}
+                <div className="file-name" style={{ fontSize: '0.95rem' }} title="Current Workspace">
+                  PDF Workspace
                 </div>
                 <div className="file-meta">
                   <span>Pages: {pages.filter(p => !p.deleted).length} of {pages.length}</span>
@@ -279,6 +293,18 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
             </div>
 
             <div className="organize-buttons">
+              <button className="btn btn-secondary" onClick={() => addMoreInputRef.current?.click()} disabled={isProcessing}>
+                <Plus size={14} />
+                Add Files
+              </button>
+              <input 
+                type="file" 
+                ref={addMoreInputRef} 
+                className="file-input" 
+                accept=".pdf,application/pdf,image/*"
+                multiple
+                onChange={handleFileChange} 
+              />
               <button className="btn btn-secondary" onClick={resetAll} disabled={isProcessing}>
                 <RefreshCw size={14} />
                 Reset
@@ -291,8 +317,8 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
                 <RotateCw size={14} />
                 Rotate All Right
               </button>
-              <button className="btn btn-secondary" onClick={clearFile} disabled={isProcessing}>
-                Change File
+              <button className="btn btn-secondary" onClick={clearWorkspace} disabled={isProcessing}>
+                Clear All
               </button>
               <button className="btn btn-success" onClick={handleExport} disabled={isProcessing}>
                 <Download size={14} />
@@ -311,7 +337,7 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
           <div className="thumbnail-container">
             {pages.map((p, index) => (
               <div 
-                key={p.pageIndex} 
+                key={p.id} 
                 className={`page-card ${p.deleted ? 'deleted' : ''} ${draggedIndex === index ? 'dragging' : ''}`}
                 style={{
                   opacity: draggedIndex === index ? 0.4 : (p.deleted ? 0.35 : 1),
@@ -328,7 +354,7 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
                   {p.dataUrl ? (
                     <img 
                       src={p.dataUrl} 
-                      alt={`Page ${p.pageIndex + 1}`}
+                      alt={`Page ${index + 1}`}
                       className="page-thumbnail"
                       style={{
                         transform: `rotate(${p.rotation}deg)`,
@@ -357,7 +383,7 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
                       <button 
                         className="btn btn-primary" 
                         style={{ padding: '6px 12px', fontSize: '0.75rem', borderRadius: '4px' }}
-                        onClick={() => toggleDeletePage(p.pageIndex)}
+                        onClick={() => toggleDeletePage(p.id)}
                       >
                         Restore
                       </button>
@@ -365,29 +391,30 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
                   )}
                 </div>
 
-                <div className="page-number-badge">
-                  Page {p.pageIndex + 1}
+                <div className="page-number-badge" style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  {p.type === 'pdf' ? <FileText size={12} style={{ opacity: 0.8 }} /> : <ImageIcon size={12} style={{ opacity: 0.8 }} />}
+                  <span>Page {index + 1}</span>
                 </div>
 
                 {!p.deleted && (
                   <div className="page-card-controls">
                     <button 
                       className="page-card-btn" 
-                      onClick={() => rotatePage(p.pageIndex, 'ccw')}
+                      onClick={() => rotatePage(p.id, 'ccw')}
                       title="Rotate counter-clockwise"
                     >
                       <RotateCcw size={14} />
                     </button>
                     <button 
                       className="page-card-btn" 
-                      onClick={() => rotatePage(p.pageIndex, 'cw')}
+                      onClick={() => rotatePage(p.id, 'cw')}
                       title="Rotate clockwise"
                     >
                       <RotateCw size={14} />
                     </button>
                     <button 
                       className="page-card-btn delete" 
-                      onClick={() => toggleDeletePage(p.pageIndex)}
+                      onClick={() => toggleDeletePage(p.id)}
                       title="Delete page"
                     >
                       <Trash2 size={14} />
@@ -400,26 +427,27 @@ export const OrganizeTab: React.FC<OrganizeTabProps> = ({ addNotification }) => 
         </>
       )}
 
-      {!file && !isProcessing && (
+      {pages.length === 0 && !isProcessing && (
         <div className="instructions-box">
           <Info size={16} className="instructions-box-icon" />
           <div className="instructions-text">
             <p>How it works</p>
             <ul>
-              <li>Upload a single PDF document. Pages will load visually in real-time.</li>
-              <li>Drag and drop the page thumbnails to reorder them in any sequence.</li>
-              <li>Hover over a page to rotate it 90 degrees left/right, or delete it.</li>
-              <li>Use the controls at the top to apply actions to the whole document (Rotate All, Reset, etc.).</li>
-              <li>Click "Export PDF" to download your modified document. Page updates are executed instantly in the browser.</li>
+              <li>Upload one or multiple PDF documents or image files (PNG, JPG, WEBP, GIF, SVG) using the dropzone.</li>
+              <li>PDF pages are rendered visually in real-time, while images populate directly.</li>
+              <li>Drag and drop the thumbnails to reorder them in any sequence.</li>
+              <li>Hover over a page to rotate it or delete it. Deleted pages can be restored before export.</li>
+              <li>Use the controls at the top to add more files, rotate all pages, reset changes, or clear the workspace.</li>
+              <li>Click "Export PDF" to compile everything into a single PDF. Page operations are executed instantly in the browser.</li>
             </ul>
           </div>
         </div>
       )}
 
-      {isProcessing && !file && (
+      {isProcessing && pages.length === 0 && (
         <div className="loader-container">
           <div className="spinner" />
-          <div>Loading PDF pages...</div>
+          <div>Loading pages...</div>
         </div>
       )}
     </div>

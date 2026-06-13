@@ -7,7 +7,8 @@ PDF Tools is a fast, secure, and responsive local web application designed to ha
 ## Use Cases
 
 1. **Combining Documents (Merge)**: Merging reports, essays, scan pieces, or receipts from different sources into a single continuous PDF file.
-2. **Document Organization (Rotate & Delete Pages)**:
+2. **Document & Image Organization (Rotate, Delete & Reorder Pages)**:
+   - Creating a custom PDF by combining pages from multiple PDFs and images (JPG, PNG, WEBP, GIF, SVG).
    - Fixing page orientations (e.g., upside-down or sideways pages resulting from physical scanner feeds).
    - Deleting unnecessary placeholder pages, separator sheets, or blank pages before sharing or archiving a document.
 3. **Format Migration (PDF to Word Document)**: Migrating standard PDF documents to editable Microsoft Word files (`.docx`) for quick editing, layout updates, or extraction of text and tables.
@@ -36,10 +37,10 @@ graph TD
     H -->|Stream back PDF response| A
 ```
 
-### Client-Side Processing (Merge, Rotate, Delete)
+### Client-Side Processing (Merge, Rotate, Delete, Reorder & Image Embedding)
 To eliminate upload latency, reduce server CPU load, and guarantee data privacy, core page manipulations are performed **entirely client-side** inside the browser using `pdf-lib` and `pdfjs-dist`:
-- **Thumbnail Rendering**: The browser extracts pages using `pdfjs-dist` (PDF.js) and draws them to HTML5 `<canvas>` nodes, generating incremental thumbnails in real-time.
-- **Assembly & Edit**: All deletion and rotation logic is tracked in browser memory. When exporting, `pdf-lib` constructs the final PDF buffer in-browser, immediately initiating a browser download without sending original document bytes over the network.
+- **Thumbnail Rendering**: The browser extracts pages using `pdfjs-dist` (PDF.js) and draws them to HTML5 `<canvas>` nodes. Images are read directly as Data URLs, processed via HTML5 Canvas to ensure compatibility (converting to standard JPEGs or PNGs), and rendered instantly as page cards.
+- **Assembly & Edit**: All deletion, rotation, and reordering logic is tracked in browser memory. When exporting, `pdf-lib` compiles pages from the source PDF ArrayBuffers and embeds the uploaded image files to build the final PDF document. The download is initiated in-browser without sending raw file data over the network.
 
 ### Server-Side Processing (PDF to Word & Document to PDF)
 Advanced layouts and document parsing operations are handled by the server:
