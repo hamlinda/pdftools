@@ -40,5 +40,30 @@ else
     echo ""
 fi
 
-# Run uvicorn server
-python3 -m uvicorn backend.main:app --host $HOST --port 8042
+# Run uvicorn server in background
+nohup python3 -m uvicorn backend.main:app --host $HOST --port 8042 > uvicorn.log 2>&1 &
+
+# Give it a moment to start
+sleep 1
+
+# Verify the server started
+PID=$(lsof -t -i :8042 2>/dev/null)
+if [ -z "$PID" ]; then
+    PID=$(ss -lptn 'sport = :8042' 2>/dev/null | grep -o -E 'pid=[0-9]+' | cut -d= -f2 | uniq)
+fi
+if [ -z "$PID" ]; then
+    PID=$(pgrep -f "uvicorn backend.main:app")
+fi
+
+if [ -n "$PID" ]; then
+    echo "✓ PDF Tools started successfully in the background (PID: $PID)."
+    echo "  Logs are being written to 'uvicorn.log'."
+    echo "  To stop the server, run: ./shutdown.sh"
+    echo "================================================================="
+    echo ""
+else
+    echo "❌ Error: Failed to start the server. Check 'uvicorn.log' for details."
+    echo "================================================================="
+    echo ""
+    exit 1
+fi

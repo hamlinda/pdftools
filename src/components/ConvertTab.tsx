@@ -72,12 +72,16 @@ export const ConvertTab: React.FC<ConvertTabProps> = ({ addNotification }) => {
     const progressInterval = setInterval(() => {
       setProgress((prev) => {
         if (prev < 40) {
+          setStatusText('Uploading PDF to server...');
           return prev + 5; // upload stage
-        } else if (prev < 85) {
-          setStatusText('Reconstructing PDF text & layout structures...');
-          return prev + 2; // parsing stage
-        } else if (prev < 95) {
-          setStatusText('Generating Word Document (.docx)...');
+        } else if (prev < 70) {
+          setStatusText('Extracting digital text layers...');
+          return prev + 3; // parsing stage
+        } else if (prev < 90) {
+          setStatusText('Running OCR fallback for scanned pages...');
+          return prev + 1.5; // OCR stage
+        } else if (prev < 98) {
+          setStatusText('Assembling editable Word Document (.docx)...');
           return prev + 0.5; // docx generation
         }
         return prev;
@@ -218,9 +222,9 @@ export const ConvertTab: React.FC<ConvertTabProps> = ({ addNotification }) => {
             <p>How it works</p>
             <ul>
               <li>Upload a PDF document (limit 20MB).</li>
-              <li>Click "Convert to Word". The file will be sent to the backend for conversion.</li>
-              <li>The engine analyzes the layout structure, parsing images, text blocks, and tables to reconstruct a standard `.docx` file.</li>
-              <li>Once conversion completes, your browser will automatically start downloading the Word document.</li>
+              <li>Click "Convert to Word" to start the conversion process.</li>
+              <li>The engine extracts digital text layers to construct flowing, editable paragraphs. For scanned pages or images, it uses high-fidelity Tesseract OCR to automatically perform text extraction.</li>
+              <li>Once conversion completes, your browser will automatically download the editable Word document.</li>
             </ul>
           </div>
         </div>

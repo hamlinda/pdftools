@@ -77,13 +77,31 @@ def get_network_info():
     
     return {"local_ip": local_ip}
 
+def clean_text_lines(text: str) -> str:
+    """
+    Cleans text lines by stripping whitespace and joining them,
+    handling word hyphens across line breaks.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    result = ""
+    for line in lines:
+        if result:
+            if result.endswith("-"):
+                result = result[:-1] + line
+            else:
+                result += " " + line
+        else:
+            result = line
+    return result
+
+
 @app.post("/api/pdf-to-docx")
 def convert_pdf_to_docx(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...)
 ):
     """
-    Uploads a PDF, converts it to DOCX using pdf2docx in a background thread, 
+    Uploads a PDF, extracts text (using digital extraction or Tesseract OCR for scanned pages),
     returns the DOCX file, and registers a cleanup task.
     """
     # 1. Validate extension
@@ -123,10 +141,87 @@ def convert_pdf_to_docx(
         logging.info(f"Starting conversion for file: {sanitized_filename} -> size: {os.path.getsize(pdf_path)} bytes")
 
         # 3. Perform conversion (run synchronously; FastAPI executes sync endpoints in a threadpool)
-        cv = Converter(pdf_path)
-        # Parse all pages
-        cv.convert(docx_path, start=0, end=None)
-        cv.close()
+        import fitz
+        import docx
+        from docx import Document
+        
+        doc = Document()
+        pdf_doc = fitz.open(pdf_path)
+        
+        for page_num in range(len(pdf_doc)):
+            page = pdf_doc.load_page(page_num)
+            
+            # Extract digital text blocks
+            blocks = page.get_text("blocks")
+            text_blocks = [b for b in blocks if b[6] == 0 and b[4].strip()]
+            
+            full_digital_text = "".join([b[4] for b in text_blocks])
+            alnum_count = sum(1 for c in full_digital_text if c.isalnum())
+            
+            paragraphs_to_add = []
+            
+            if alnum_count >= 30:
+                logging.info(f"Page {page_num + 1}: Using digital text extraction ({alnum_count} alnum chars).")
+                for block in text_blocks:
+                    block_text = block[4]
+                    cleaned = clean_text_lines(block_text)
+                    if cleaned:
+                        paragraphs_to_add.append(cleaned)
+            else:
+                logging.info(f"Page {page_num + 1}: Scanned page or low digital text ({alnum_count} alnum chars). Running OCR...")
+                zoom = 150 / 72
+                mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat)
+                
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_img:
+                    temp_img_path = temp_img.name
+                try:
+                    pix.save(temp_img_path)
+                    cmd = ["tesseract", temp_img_path, "stdout", "-l", "eng"]
+                    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+                    
+                    if res.returncode == 0:
+                        ocr_text = res.stdout
+                        raw_paragraphs = ocr_text.split("\n\n")
+                        for p in raw_paragraphs:
+                            cleaned = clean_text_lines(p)
+                            if cleaned:
+                                paragraphs_to_add.append(cleaned)
+                        logging.info(f"Page {page_num + 1}: OCR successfully extracted {len(paragraphs_to_add)} paragraphs.")
+                    else:
+                        logging.error(f"Page {page_num + 1}: OCR failed with exit code {res.returncode}: {res.stderr}")
+                        # Fallback to whatever digital text we have
+                        for block in text_blocks:
+                            cleaned = clean_text_lines(block[4])
+                            if cleaned:
+                                paragraphs_to_add.append(cleaned)
+                except Exception as ocr_err:
+                    logging.error(f"Page {page_num + 1}: OCR exception: {ocr_err}")
+                    for block in text_blocks:
+                        cleaned = clean_text_lines(block[4])
+                        if cleaned:
+                            paragraphs_to_add.append(cleaned)
+                finally:
+                    if os.path.exists(temp_img_path):
+                        os.remove(temp_img_path)
+            
+            if page_num > 0:
+                doc.add_page_break()
+                
+            p_header = doc.add_paragraph()
+            run = p_header.add_run(f"--- Page {page_num + 1} ---")
+            run.bold = True
+            p_header.paragraph_format.space_before = docx.shared.Pt(12)
+            p_header.paragraph_format.space_after = docx.shared.Pt(6)
+            
+            if not paragraphs_to_add:
+                doc.add_paragraph("[Empty Page]")
+            else:
+                for p_text in paragraphs_to_add:
+                    p = doc.add_paragraph(p_text)
+                    p.paragraph_format.space_after = docx.shared.Pt(6)
+                    
+        doc.save(docx_path)
 
         # Check if the output docx was created
         if not os.path.exists(docx_path) or os.path.getsize(docx_path) == 0:
