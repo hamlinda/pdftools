@@ -1,9 +1,12 @@
 import { useState } from 'react';
-import { Layers, LayoutGrid, FileText, FileUp, Wrench, ShieldCheck, X } from 'lucide-react';
+import { Layers, LayoutGrid, FileText, FileUp, Wrench, ShieldCheck, X, Image, Images, Zap } from 'lucide-react';
 import { MergeTab } from './components/MergeTab';
 import { OrganizeTab } from './components/OrganizeTab';
 import { ConvertTab } from './components/ConvertTab';
 import { DocToPdfTab } from './components/DocToPdfTab';
+import { PdfToJpgTab } from './components/PdfToJpgTab';
+import { JpgToPdfTab } from './components/JpgToPdfTab';
+import { CompressTab } from './components/CompressTab';
 import { NetworkInfo } from './components/NetworkInfo';
 import './App.css';
 
@@ -14,7 +17,7 @@ interface Toast {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'merge' | 'organize' | 'convert' | 'docToPdf'>('merge');
+  const [activeTab, setActiveTab] = useState<'merge' | 'organize' | 'convert' | 'docToPdf' | 'pdfToJpg' | 'jpgToPdf' | 'compress'>('merge');
   const [notifications, setNotifications] = useState<Toast[]>([]);
 
   const addNotification = (message: string, type: 'success' | 'error') => {
@@ -77,6 +80,27 @@ function App() {
           <FileUp size={18} />
           Doc to PDF
         </button>
+        <button
+          className={`tab-btn ${activeTab === 'pdfToJpg' ? 'active' : ''}`}
+          onClick={() => setActiveTab('pdfToJpg')}
+        >
+          <Image size={18} />
+          PDF to JPG
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'jpgToPdf' ? 'active' : ''}`}
+          onClick={() => setActiveTab('jpgToPdf')}
+        >
+          <Images size={18} />
+          JPG to PDF
+        </button>
+        <button
+          className={`tab-btn ${activeTab === 'compress' ? 'active' : ''}`}
+          onClick={() => setActiveTab('compress')}
+        >
+          <Zap size={18} />
+          Compress PDF
+        </button>
       </nav>
 
       {/* Active Tab Content */}
@@ -85,6 +109,9 @@ function App() {
         {activeTab === 'organize' && <OrganizeTab addNotification={addNotification} />}
         {activeTab === 'convert' && <ConvertTab addNotification={addNotification} />}
         {activeTab === 'docToPdf' && <DocToPdfTab addNotification={addNotification} />}
+        {activeTab === 'pdfToJpg' && <PdfToJpgTab addNotification={addNotification} />}
+        {activeTab === 'jpgToPdf' && <JpgToPdfTab addNotification={addNotification} />}
+        {activeTab === 'compress' && <CompressTab addNotification={addNotification} />}
       </main>
 
       {/* Footer */}

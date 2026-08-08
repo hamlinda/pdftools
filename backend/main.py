@@ -1,12 +1,17 @@
 import os
+import io
 import uuid
 import shutil
 import socket
 import logging
 import tempfile
 import subprocess
+import zipfile
 import markdown
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Request
+from typing import List
+from PIL import Image
+import fitz
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,6 +20,7 @@ from html.parser import HTMLParser
 from reportlab.lib.pagesizes import letter
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Preformatted
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
 
 
 # Configure logging
@@ -668,6 +674,463 @@ def convert_doc_to_pdf(
             status_code=500,
             detail=f"An error occurred during conversion: {str(e)}"
         )
+
+
+@app.post("/api/pdf-to-jpg")
+def convert_pdf_to_jpg(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    join_pages: bool = Form(False)
+):
+    """
+    Uploads a PDF, converts pages to JPG images.
+    If multi-page and join_pages is False, returns a ZIP file.
+    If multi-page and join_pages is True, joins pages vertically and returns a single JPG.
+    If single page, returns a single JPG.
+    """
+    filename = file.filename or "document.pdf"
+    sanitized_filename = os.path.basename(filename)
+    if not sanitized_filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid file type. Only PDF documents are allowed."
+        )
+
+    temp_dir = tempfile.mkdtemp()
+    pdf_path = os.path.join(temp_dir, f"{uuid.uuid4()}.pdf")
+    background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+    try:
+        # Save upload to temporary file
+        with open(pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Validate size
+        if os.path.getsize(pdf_path) > 20 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail="PDF file exceeds the 20MB size limit."
+            )
+
+        if os.path.getsize(pdf_path) < 5:
+             raise HTTPException(status_code=400, detail="Invalid PDF file. File is too small.")
+             
+        with open(pdf_path, "rb") as f:
+            magic_bytes = f.read(5)
+            if magic_bytes != b"%PDF-":
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Invalid PDF file header. The uploaded file is not a valid PDF."
+                )
+
+        logging.info(f"Converting PDF to JPG: {sanitized_filename} (join_pages={join_pages})")
+
+        doc = fitz.open(pdf_path)
+        num_pages = len(doc)
+        if num_pages == 0:
+            raise HTTPException(status_code=400, detail="The PDF file has no pages.")
+
+        # Define rendering resolution: 150 DPI is standard for high quality
+        zoom = 150 / 72
+        mat = fitz.Matrix(zoom, zoom)
+
+        base_name = os.path.splitext(sanitized_filename)[0]
+
+        # Case 1: Single page PDF or joined vertically
+        if num_pages == 1 or (num_pages > 1 and join_pages):
+            if num_pages == 1:
+                page = doc.load_page(0)
+                pix = page.get_pixmap(matrix=mat)
+                jpg_filename = f"{base_name}.jpg"
+                jpg_path = os.path.join(temp_dir, jpg_filename)
+                pix.save(jpg_path)
+            else:
+                # Join multiple pages vertically
+                pil_images = []
+                total_height = 0
+                max_width = 0
+                for page_num in range(num_pages):
+                    page = doc.load_page(page_num)
+                    pix = page.get_pixmap(matrix=mat)
+                    img_data = pix.tobytes("png")
+                    img = Image.open(io.BytesIO(img_data))
+                    pil_images.append(img)
+                    total_height += img.height
+                    if img.width > max_width:
+                          max_width = img.width
+                
+                combined_img = Image.new("RGB", (max_width, total_height), (255, 255, 255))
+                current_y = 0
+                for img in pil_images:
+                    x_offset = (max_width - img.width) // 2
+                    combined_img.paste(img, (x_offset, current_y))
+                    current_y += img.height
+
+                jpg_filename = f"{base_name}_combined.jpg"
+                jpg_path = os.path.join(temp_dir, jpg_filename)
+                combined_img.save(jpg_path, "JPEG", quality=90)
+
+            return FileResponse(
+                path=jpg_path,
+                filename=jpg_filename,
+                media_type="image/jpeg",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{jpg_filename}"',
+                    "X-Content-Type-Options": "nosniff"
+                }
+            )
+
+        # Case 2: Multi-page PDF to separate JPGs (Zipped)
+        else:
+            zip_filename = f"{base_name}_images.zip"
+            zip_path = os.path.join(temp_dir, zip_filename)
+            
+            with zipfile.ZipFile(zip_path, 'w') as zipf:
+                for page_num in range(num_pages):
+                    page = doc.load_page(page_num)
+                    pix = page.get_pixmap(matrix=mat)
+                    page_jpg_path = os.path.join(temp_dir, f"{base_name}_page_{page_num + 1}.jpg")
+                    pix.save(page_jpg_path)
+                    zipf.write(page_jpg_path, arcname=f"{base_name}_page_{page_num + 1}.jpg")
+                    os.remove(page_jpg_path)
+
+            return FileResponse(
+                path=zip_path,
+                filename=zip_filename,
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{zip_filename}"',
+                    "X-Content-Type-Options": "nosniff"
+                }
+            )
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logging.error(f"Error during PDF to JPG conversion: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred during conversion: {str(e)}"
+        )
+
+
+@app.post("/api/jpg-to-pdf")
+def convert_jpg_to_pdf(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...)
+):
+    """
+    Uploads a list of JPG/JPEG/PNG images, compiles them into a single multi-page PDF.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+        
+    temp_dir = tempfile.mkdtemp()
+    background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+    try:
+        pil_images = []
+        for index, file in enumerate(files):
+            filename = file.filename or f"image_{index}.jpg"
+            sanitized_filename = os.path.basename(filename)
+            _, ext = os.path.splitext(sanitized_filename.lower())
+            if ext not in {".jpg", ".jpeg", ".png"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid file type: {sanitized_filename}. Only JPG, JPEG, and PNG images are allowed."
+                )
+
+            # Write to a temp image file to validate size and load with Pillow
+            temp_img_path = os.path.join(temp_dir, f"img_{index}{ext}")
+            with open(temp_img_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            # Limit file size to 10MB per image
+            if os.path.getsize(temp_img_path) > 10 * 1024 * 1024:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {sanitized_filename} exceeds the 10MB limit."
+                )
+
+            try:
+                # Verify and load image
+                img = Image.open(temp_img_path)
+                img.verify()
+                # Re-open because verify() makes the image object unusable for saving
+                img = Image.open(temp_img_path)
+                # Convert to RGB mode if not already
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                # Load into memory to avoid file locks
+                img.load()
+                pil_images.append(img)
+            except Exception as img_err:
+                logging.error(f"Image load failure for {sanitized_filename}: {img_err}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Failed to process image {sanitized_filename}. The file might be corrupted."
+                )
+
+        if not pil_images:
+            raise HTTPException(status_code=400, detail="No valid images to convert.")
+
+        # Save to a PDF file
+        pdf_filename = "converted_images.pdf"
+        pdf_path = os.path.join(temp_dir, pdf_filename)
+        
+        # Pillow can save a list of images to a single PDF
+        pil_images[0].save(
+            pdf_path,
+            save_all=True,
+            append_images=pil_images[1:]
+        )
+
+        # Double check file was created and is non-empty
+        if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to generate the PDF file."
+            )
+
+        return FileResponse(
+            path=pdf_path,
+            filename=pdf_filename,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{pdf_filename}"',
+                "X-Content-Type-Options": "nosniff"
+            }
+        )
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logging.error(f"Error during JPG to PDF conversion: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred during conversion: {str(e)}"
+        )
+
+
+@app.post("/api/evaluate-pdf")
+def evaluate_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """
+    Uploads a PDF, inspects its metadata (size, pages, image count),
+    and returns a recommended compression profile.
+    """
+    filename = file.filename or "document.pdf"
+    sanitized_filename = os.path.basename(filename)
+    if not sanitized_filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid file type. Only PDF documents are allowed."
+        )
+
+    temp_dir = tempfile.mkdtemp()
+    pdf_path = os.path.join(temp_dir, f"{uuid.uuid4()}.pdf")
+    background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+    try:
+        # Save upload to temporary file
+        with open(pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Validate size
+        file_size = os.path.getsize(pdf_path)
+        if file_size > 200 * 1024 * 1024:  # 200MB limit for local compression
+            raise HTTPException(
+                status_code=400,
+                detail="PDF file exceeds the 200MB size limit."
+            )
+
+        if file_size < 5:
+             raise HTTPException(status_code=400, detail="Invalid PDF file. File is too small.")
+             
+        with open(pdf_path, "rb") as f:
+            magic_bytes = f.read(5)
+            if magic_bytes != b"%PDF-":
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Invalid PDF file header. The uploaded file is not a valid PDF."
+                )
+
+        doc = fitz.open(pdf_path)
+        pages = len(doc)
+        
+        # Count images
+        image_count = 0
+        for page in doc:
+            try:
+                image_count += len(page.get_images())
+            except Exception:
+                pass
+        
+        doc.close()
+
+        # Recommendation logic
+        if file_size < 500 * 1024 and image_count == 0:
+            rec_level = "none"
+            rec_text = "This PDF is already very small (under 500 KB) and contains no images. Compression is not recommended as it will not yield noticeable savings."
+            expected_reduction = "0% - 5%"
+        elif file_size > 5 * 1024 * 1024:
+            rec_level = "high"
+            rec_text = f"This PDF is quite large ({round(file_size / (1024 * 1024), 2)} MB) and contains {image_count} image(s). We recommend High compression (screen quality, 72 DPI) to significantly reduce the file size."
+            expected_reduction = "50% - 80%"
+        else:
+            rec_level = "medium"
+            if image_count > 0:
+                rec_text = f"This PDF contains {image_count} image(s) and is of moderate size. We recommend Medium compression (e-book quality, 150 DPI) to balance layout readability and file size."
+                expected_reduction = "30% - 60%"
+            else:
+                rec_text = "This document is of moderate size but has no images. We recommend Medium compression to optimize document structures and page content stream inflation."
+                expected_reduction = "10% - 30%"
+
+        return {
+            "filename": sanitized_filename,
+            "file_size_bytes": file_size,
+            "pages": pages,
+            "image_count": image_count,
+            "recommendation": {
+                "level": rec_level,
+                "text": rec_text,
+                "expected_reduction": expected_reduction
+            }
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logging.error(f"Error during PDF evaluation: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred during evaluation: {str(e)}"
+        )
+
+
+@app.post("/api/compress-pdf")
+def compress_pdf(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    level: str = Form("medium")
+):
+    """
+    Uploads a PDF, compresses it using Ghostscript with the specified quality profile.
+    """
+    filename = file.filename or "document.pdf"
+    sanitized_filename = os.path.basename(filename)
+    if not sanitized_filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid file type. Only PDF documents are allowed."
+        )
+
+    # Map compression level to Ghostscript PDFSETTINGS profiles
+    level_map = {
+        "high": "/screen",      # 72 DPI
+        "medium": "/ebook",      # 150 DPI
+        "low": "/printer"        # 300 DPI
+    }
+    gs_profile = level_map.get(level.lower(), "/ebook")
+
+    temp_dir = tempfile.mkdtemp()
+    input_path = os.path.join(temp_dir, f"{uuid.uuid4()}.pdf")
+    output_path = os.path.join(temp_dir, f"{uuid.uuid4()}.pdf")
+    background_tasks.add_task(cleanup_temp_dir, temp_dir)
+
+    try:
+        # Save upload to temporary file
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Validate size
+        if os.path.getsize(input_path) > 200 * 1024 * 1024:
+            raise HTTPException(
+                status_code=400,
+                detail="PDF file exceeds the 200MB size limit."
+            )
+
+        if os.path.getsize(input_path) < 5:
+             raise HTTPException(status_code=400, detail="Invalid PDF file. File is too small.")
+             
+        with open(input_path, "rb") as f:
+            magic_bytes = f.read(5)
+            if magic_bytes != b"%PDF-":
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Invalid PDF file header. The uploaded file is not a valid PDF."
+                )
+
+        logging.info(f"Compressing PDF: {sanitized_filename} (level: {level}, profile: {gs_profile})")
+
+        # Run Ghostscript to compress PDF
+        cmd = [
+            "gs",
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            f"-dPDFSETTINGS={gs_profile}",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={output_path}",
+            input_path
+        ]
+
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120
+        )
+
+        if result.returncode != 0:
+            logging.error(f"Ghostscript compression failed with return code {result.returncode}: {result.stderr}")
+            raise HTTPException(
+                status_code=500,
+                detail="Ghostscript compression failed. Please verify that the PDF is not password-protected or corrupted."
+            )
+
+        # Double check output file exists and is non-empty
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="Compression failed to create output file."
+            )
+
+        # Derive download filename
+        base_name = os.path.splitext(sanitized_filename)[0]
+        compressed_filename = f"{base_name}_compressed.pdf"
+
+        logging.info(f"PDF compression successful: {sanitized_filename} -> size: {os.path.getsize(output_path)} bytes")
+
+        return FileResponse(
+            path=output_path,
+            filename=compressed_filename,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="{compressed_filename}"',
+                "X-Content-Type-Options": "nosniff"
+            }
+        )
+
+    except HTTPException as he:
+        raise he
+    except subprocess.TimeoutExpired:
+        logging.error("Ghostscript compression timed out.")
+        raise HTTPException(
+            status_code=504,
+            detail="PDF compression operation timed out."
+        )
+    except Exception as e:
+        logging.error(f"Error during PDF compression: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred during compression: {str(e)}"
+        )
+
 
 # Static files mapping
 
